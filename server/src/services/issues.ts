@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, like, lt, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -99,6 +99,8 @@ export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
 const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
+export const MAX_AGENT_CHILD_ISSUES_PER_RUN = 20;
+export const MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY = 60;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
@@ -3161,6 +3163,49 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
   }, 0);
 }
 
+async function assertAgentChildIssueCreationWithinSwarmCaps(args: {
+  db: Db;
+  companyId: string;
+  createdByAgentId: string | null | undefined;
+  runId: string | null | undefined;
+}) {
+  if (!args.createdByAgentId) return;
+
+  const dayWindowStart = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const [{ childCount: rollingDayChildCount }] = await args.db
+    .select({ childCount: sql<number>`count(*)::int` })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, args.companyId),
+      isNotNull(issues.parentId),
+      isNotNull(issues.createdByAgentId),
+      gt(issues.createdAt, dayWindowStart),
+    ));
+
+  if (rollingDayChildCount >= MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY) {
+    throw unprocessable(
+      `Agent child issue creation is capped at ${MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY} per rolling 24h window`,
+    );
+  }
+
+  if (!args.runId) return;
+  const [{ childCount: runChildCount }] = await args.db
+    .select({ childCount: sql<number>`count(*)::int` })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, args.companyId),
+      isNotNull(issues.parentId),
+      isNotNull(issues.createdByAgentId),
+      eq(issues.originRunId, args.runId),
+    ));
+
+  if (runChildCount >= MAX_AGENT_CHILD_ISSUES_PER_RUN) {
+    throw unprocessable(
+      `Agent child issue creation is capped at ${MAX_AGENT_CHILD_ISSUES_PER_RUN} per run`,
+    );
+  }
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -4584,6 +4629,14 @@ export function issueService(db: Db) {
         throw unprocessable(`Parent issue already has the maximum ${MAX_CHILD_ISSUES_CREATED_BY_HELPER} child issues for this helper`);
       }
 
+      const actorRunId = data.originRunId ?? data.watchdogActorRunId ?? null;
+      await assertAgentChildIssueCreationWithinSwarmCaps({
+        db,
+        companyId: parent.companyId,
+        createdByAgentId: data.createdByAgentId,
+        runId: actorRunId,
+      });
+
       const {
         acceptanceCriteria,
         blockParentUntilDone,
@@ -4594,6 +4647,7 @@ export function issueService(db: Db) {
       const child = await issueService(db).create(parent.companyId, {
         ...issueData,
         parentId: parent.id,
+        originRunId: issueData.originRunId ?? actorRunId,
         projectId: issueData.projectId ?? parent.projectId,
         goalId: issueData.goalId ?? parent.goalId,
         requestDepth: clampIssueRequestDepth(

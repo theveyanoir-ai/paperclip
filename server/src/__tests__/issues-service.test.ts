@@ -33,6 +33,8 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
+  MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY,
+  MAX_AGENT_CHILD_ISSUES_PER_RUN,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
 } from "../services/issues.ts";
@@ -136,6 +138,37 @@ async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
       "updated_at" timestamptz NOT NULL DEFAULT now()
     );
   `));
+}
+
+async function seedIssueServiceTestCompany(db: ReturnType<typeof createDb>) {
+  const companyId = randomUUID();
+  await db.insert(companies).values({
+    id: companyId,
+    name: "Paperclip",
+    issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    requireBoardApprovalForNewAgents: false,
+  });
+  return companyId;
+}
+
+function issueServiceTestAgentRow(companyId: string, input: {
+  id: string;
+  name: string;
+  status?: string;
+  reportsTo?: string | null;
+}) {
+  return {
+    id: input.id,
+    companyId,
+    name: input.name,
+    role: "engineer",
+    status: input.status ?? "active",
+    reportsTo: input.reportsTo ?? null,
+    adapterType: "codex_local",
+    adapterConfig: {},
+    runtimeConfig: {},
+    permissions: {},
+  };
 }
 
 if (!embeddedPostgresSupport.supported) {
@@ -2890,6 +2923,95 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
 
     expect(child.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  it("rejects agent child issue creation after the per-run swarm cap", async () => {
+    const companyId = await seedIssueServiceTestCompany(db);
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(agents).values(issueServiceTestAgentRow(companyId, { id: agentId, name: "SwarmWorker" }));
+    const parent = await svc.create(companyId, {
+      title: "Swarm root",
+      status: "todo",
+      createdByUserId: "user-1",
+    });
+
+    for (let index = 0; index < MAX_AGENT_CHILD_ISSUES_PER_RUN; index += 1) {
+      await svc.createChild(parent.id, {
+        title: `Run child ${index + 1}`,
+        status: "todo",
+        createdByAgentId: agentId,
+        watchdogActorRunId: runId,
+      });
+    }
+
+    await expect(svc.createChild(parent.id, {
+      title: "Run child over cap",
+      status: "todo",
+      createdByAgentId: agentId,
+      watchdogActorRunId: runId,
+    })).rejects.toMatchObject({
+      status: 422,
+      message: `Agent child issue creation is capped at ${MAX_AGENT_CHILD_ISSUES_PER_RUN} per run`,
+    });
+  });
+
+  it("rejects agent child issue creation after the rolling daily swarm cap", async () => {
+    const companyId = await seedIssueServiceTestCompany(db);
+    const agentId = randomUUID();
+    await db.insert(agents).values(issueServiceTestAgentRow(companyId, { id: agentId, name: "DailySwarmWorker" }));
+    const parents = await Promise.all(
+      Array.from({ length: 3 }, (_, index) => svc.create(companyId, {
+        title: `Daily swarm root ${index + 1}`,
+        status: "todo",
+        createdByUserId: "user-1",
+      })),
+    );
+
+    for (let index = 0; index < MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY; index += 1) {
+      await svc.createChild(parents[index % parents.length]!.id, {
+        title: `Daily child ${index + 1}`,
+        status: "todo",
+        createdByAgentId: agentId,
+      });
+    }
+
+    await expect(svc.createChild(parents[0]!.id, {
+      title: "Daily child over cap",
+      status: "todo",
+      createdByAgentId: agentId,
+    })).rejects.toMatchObject({
+      status: 422,
+      message: `Agent child issue creation is capped at ${MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY} per rolling 24h window`,
+    });
+  });
+
+  it("does not count user-created child issues toward the agent swarm cap", async () => {
+    const companyId = await seedIssueServiceTestCompany(db);
+    const agentId = randomUUID();
+    await db.insert(agents).values(issueServiceTestAgentRow(companyId, { id: agentId, name: "UnblockedWorker" }));
+    const parents = await Promise.all(
+      Array.from({ length: 3 }, (_, index) => svc.create(companyId, {
+        title: `User root ${index + 1}`,
+        status: "todo",
+        createdByUserId: "user-1",
+      })),
+    );
+
+    for (let index = 0; index < MAX_AGENT_CHILD_ISSUES_PER_ROLLING_DAY; index += 1) {
+      await svc.createChild(parents[index % parents.length]!.id, {
+        title: `User child ${index + 1}`,
+        status: "todo",
+        createdByUserId: "user-1",
+      });
+    }
+
+    const { issue: agentChild } = await svc.createChild(parents[0]!.id, {
+      title: "Agent child still allowed",
+      status: "todo",
+      createdByAgentId: agentId,
+    });
+    expect(agentChild.createdByAgentId).toBe(agentId);
   });
 });
 
