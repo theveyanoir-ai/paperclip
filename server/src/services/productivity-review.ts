@@ -283,6 +283,81 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Lifecycle guard: check if a productivity review for this source issue has
+   * EVER reached a terminal state (done/cancelled). If so, only allow a new
+   * review if the source issue has been materially updated AFTER the review
+   * was terminalized. This prevents the "respawn" bug where completed reviews
+   * re-create on the next automation cycle.
+   */
+  async function findTerminalProductivityReviewBlockingRespawn(
+    companyId: string,
+    sourceIssueId: string,
+    sourceIssueUpdatedAt: Date | null,
+  ) {
+    const latestTerminal = await db
+      .select({ id: issues.id, updatedAt: issues.updatedAt, status: issues.status })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!latestTerminal) return null;
+    // Allow a new review only if the source issue was updated AFTER the review
+    // was terminalized — meaning new activity occurred that warrants fresh review.
+    if (sourceIssueUpdatedAt && sourceIssueUpdatedAt > latestTerminal.updatedAt) {
+      return null;
+    }
+    return latestTerminal;
+  }
+
+  // ─── Per-Agent Rate Limiting ─────────────────────────────────────────────────
+  const PER_AGENT_MAX_OPEN_REVIEWS = 2;
+  const PER_AGENT_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours after last resolved review
+
+  async function countOpenReviewsForAgent(companyId: string, agentId: string): Promise<number> {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.assigneeAgentId, agentId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    return rows.length;
+  }
+
+  async function hasRecentResolvedReviewForAgent(companyId: string, agentId: string, now: Date): Promise<boolean> {
+    const cutoff = new Date(now.getTime() - PER_AGENT_COOLDOWN_MS);
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.assigneeAgentId, agentId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+          gt(issues.updatedAt, cutoff),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
   async function countRecentProductivityReviews(
     companyId: string,
     sourceIssueId: string,
@@ -808,9 +883,25 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         result.snoozed += 1;
         continue;
       }
+      // Lifecycle guard: if a terminal review exists and the source issue hasn't
+      // been updated since, skip permanently to prevent respawn.
+      if (await findTerminalProductivityReviewBlockingRespawn(candidate.companyId, candidate.id, candidate.updatedAt)) {
+        result.snoozed += 1;
+        continue;
+      }
       const sourceAgent = await getAgent(candidate.assigneeAgentId);
       if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
         result.skipped += 1;
+        continue;
+      }
+      // Per-agent rate limiting: prevent review churn for any single agent
+      const openForAgent = await countOpenReviewsForAgent(candidate.companyId, candidate.assigneeAgentId!);
+      if (openForAgent >= PER_AGENT_MAX_OPEN_REVIEWS) {
+        result.skipped += 1;
+        continue;
+      }
+      if (await hasRecentResolvedReviewForAgent(candidate.companyId, candidate.assigneeAgentId!, now)) {
+        result.snoozed += 1;
         continue;
       }
       const evidence = await collectEvidence(candidate, sourceAgent, thresholds, now);
@@ -906,9 +997,68 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     });
   }
 
+  async function terminalizeNoopReviewContinuation(input: {
+    companyId: string;
+    issueId: string;
+    runId: string;
+    agentId: string;
+    reason: string;
+    now?: Date;
+  }) {
+    const now = input.now ?? new Date();
+    const reviewIssue = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        originKind: issues.originKind,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!reviewIssue || reviewIssue.originKind !== PRODUCTIVITY_REVIEW_ORIGIN_KIND) {
+      return { terminalized: false as const };
+    }
+    if (["done", "cancelled"].includes(reviewIssue.status)) {
+      return { terminalized: true as const, alreadyTerminal: true as const, issueId: reviewIssue.id };
+    }
+
+    await db
+      .update(issues)
+      .set({
+        status: "done",
+        assigneeAgentId: null,
+        updatedAt: now,
+      })
+      .where(eq(issues.id, reviewIssue.id));
+
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.productivity_review_terminalized",
+      entityType: "issue",
+      entityId: reviewIssue.id,
+      details: {
+        source: "productivity_review.noop_continuation",
+        identifier: reviewIssue.identifier,
+        previousStatus: reviewIssue.status,
+        previousAssigneeAgentId: reviewIssue.assigneeAgentId,
+        reason: input.reason,
+      },
+    });
+
+    return { terminalized: true as const, issueId: reviewIssue.id };
+  }
+
   return {
     reconcileProductivityReviews,
     isProductivityReviewContinuationHoldActive,
     recordContinuationHold,
+    terminalizeNoopReviewContinuation,
   };
 }
