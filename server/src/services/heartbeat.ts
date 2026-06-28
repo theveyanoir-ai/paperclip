@@ -158,7 +158,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { recoveryService } from "./recovery/service.js";
-import { productivityReviewService } from "./productivity-review.js";
+import { PRODUCTIVITY_REVIEW_ORIGIN_KIND, productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
 import {
@@ -5050,6 +5050,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
+          originKind: issues.originKind,
           assigneeAgentId: issues.assigneeAgentId,
           executionState: issues.executionState,
           projectId: issues.projectId,
@@ -5076,6 +5077,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         : null;
     if (issue) {
+      if (issue.originKind === PRODUCTIVITY_REVIEW_ORIGIN_KIND) {
+        await productivityReviews.terminalizeNoopReviewContinuation({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          runId: run.id,
+          agentId: run.agentId,
+          reason: run.livenessReason ?? "Run ended without concrete progress",
+        });
+        await setRunStatus(run.id, run.status, {
+          livenessReason:
+            `${run.livenessReason ?? "Run ended without concrete progress"}; productivity review terminalized without continuation`,
+        });
+        return;
+      }
+
       const productivityHold = await productivityReviews.isProductivityReviewContinuationHoldActive({
         companyId: issue.companyId,
         issueId: issue.id,

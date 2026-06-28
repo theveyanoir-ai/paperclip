@@ -537,6 +537,61 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(activities[0]?.entityId).toBe(seeded.issueId);
   });
 
+  it("terminalizes and unassigns no-op productivity review continuations", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const reviewId = randomUUID();
+
+    await db.insert(issues).values({
+      id: reviewId,
+      companyId: seeded.companyId,
+      title: "Review productivity for source issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: seeded.managerId,
+      originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+      originId: seeded.issueId,
+      originFingerprint: "productivity-review:" + seeded.issueId,
+      parentId: seeded.issueId,
+      issueNumber: 2,
+      identifier: seeded.issuePrefix + "-2",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const [latestRun] = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.managerId,
+      issueId: reviewId,
+      count: 1,
+      now,
+    });
+    const runId = latestRun!.id as string;
+
+    const result = await productivityReviewService(db).terminalizeNoopReviewContinuation({
+      companyId: seeded.companyId,
+      issueId: reviewId,
+      runId,
+      agentId: seeded.managerId,
+      reason: "Run ended without concrete progress",
+      now,
+    });
+
+    expect(result.terminalized).toBe(true);
+    const [review] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, reviewId));
+    expect(review?.status).toBe("done");
+    expect(review?.assigneeAgentId).toBeNull();
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.productivity_review_terminalized"));
+    expect(activities).toHaveLength(1);
+    expect(activities[0]?.entityId).toBe(reviewId);
+  });
+
   it("clamps poisoned requestDepth metadata instead of aborting productivity reconciliation", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
