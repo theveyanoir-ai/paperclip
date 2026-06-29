@@ -210,6 +210,50 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
   });
 
+  it("does not create productivity reviews for MCP mailbox traffic", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const mailboxSeeded = await seedAssignedIssue({
+      originKind: "mcp_mailbox",
+    });
+    await insertRuns({
+      companyId: mailboxSeeded.companyId,
+      agentId: mailboxSeeded.coderId,
+      issueId: mailboxSeeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: mailboxSeeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(await listProductivityReviews(mailboxSeeded.companyId)).toHaveLength(0);
+  });
+
+  it("does not create productivity reviews for legacy MCP mailbox titles", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await db
+      .update(issues)
+      .set({ title: "[MCP Mailbox] New message for Hermes / Governance Reviewer" })
+      .where(eq(issues.id, seeded.issueId));
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

@@ -30,6 +30,13 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 3;
+export const PRODUCTIVITY_REVIEW_EXEMPT_ORIGIN_KINDS = [
+  "mcp_mailbox",
+  "mcp_bus_delegate",
+] as const;
+const PRODUCTIVITY_REVIEW_EXEMPT_TITLE_PREFIXES = [
+  "[MCP Mailbox]",
+] as const;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -192,6 +199,13 @@ function choosePrimaryTrigger(input: {
 
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
   return trigger === "no_comment_streak" || trigger === "high_churn";
+}
+
+function isProductivityReviewExemptIssue(issue: Pick<IssueRow, "originKind" | "title">) {
+  if (PRODUCTIVITY_REVIEW_EXEMPT_ORIGIN_KINDS.includes(issue.originKind as (typeof PRODUCTIVITY_REVIEW_EXEMPT_ORIGIN_KINDS)[number])) {
+    return true;
+  }
+  return PRODUCTIVITY_REVIEW_EXEMPT_TITLE_PREFIXES.some((prefix) => issue.title.startsWith(prefix));
 }
 
 function formatTrigger(trigger: ProductivityReviewTrigger) {
@@ -876,6 +890,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         continue;
       }
       if (await isProductivityReviewDescendant(candidate)) {
+        result.skipped += 1;
+        continue;
+      }
+      if (isProductivityReviewExemptIssue(candidate)) {
         result.skipped += 1;
         continue;
       }
